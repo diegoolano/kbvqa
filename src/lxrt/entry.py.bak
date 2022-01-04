@@ -1,0 +1,346 @@
+# coding=utf-8
+# Copyright 2019 project LXRT.
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import numpy as np
+import os
+
+import torch
+import torch.nn as nn
+
+from lxrt.tokenization import BertTokenizer
+from lxrt.modeling import LXRTFeatureExtraction as VisualBertForLXRFeature, VISUAL_CONFIG
+from operator import itemgetter
+
+
+class InputFeatures(object):
+    """A single set of features of data."""
+
+    def __init__(self, input_ids, input_mask, segment_ids):
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.segment_ids = segment_ids
+
+
+def convert_sents_to_features(sents, ent_spans, max_seq_length, tokenizer, use_lm = None):
+    """Loads a data file into a list of `InputBatch`s."""
+
+    # if use_lm == "ebert" add ebert concat format here!
+
+    # We didn't have entity spans originally so we considered using KnowBert to get them? look at ebert AIDA code .. see ebert/prepare.sh .. pretty complicated...
+    # Instead we thought to try BLINK elq ?  github.com/facebookreseach/BLINK/tree/master/elq ( but it turns out you need over 100MB GPU )
+    # Finally we got spans for KVQA programatically.. see kvqa/KVQA_data_lookup.ipynb ( spacy wiki linker isn't full functional either )
+    
+    features = []
+    for (i, sent) in enumerate(sents):
+        tokens_a = tokenizer.tokenize(sent.strip())
+        if use_lm == "ebert":
+            #Add entity span tags to tokens_a
+
+            #ent_spans  # [['Francis Condon', 0, 14]]
+            #sent       # 'Francis Condon in the early 20th Century'
+
+            #print("EBERT convert", type(sents), len(sents), type(sents[0]), sents[0])    #<class 'l0st'> 32 str 'Who 0s the person 0n the 0mage? Dan0ela B0anch0 0n Requ0e',...
+            #print(type(ent_spans), len(ent_spans), type(ent_spans[0]), len(ent_spans[0]), len(ent_spans[0][0]))   
+            # <class 'list'> 5 <class 'list'> [['Daniela Bianchi', 'Yitzhak Ben-Zvi', 'Todd', ... 'Yitzhak Ben-Zvi'], 
+            # tensor([  0,  24,   0,   0,  18,  18,   0,   0,  73,  73,   0,  10, -32,   0, 0,   0,   0,   0,   0,   0,   0,   0,  13,   0,  24,  73,   0,   0, 0,  45, -32,  24]), 
+            # tensor([ 15,  39,   4,  16,  32,  32,   9,   9,  78,  78,  16,  17, -20,  16, 5,   4,   4,   4,   6,  16,   9,   3,  25,   4,  39,  78,   7,   4, 10,  58, -20,  39])]
+
+            token2char_indmap = []
+            start = 0
+            qmark_loc = -1
+            for ind in range(len(tokens_a)):
+                if tokens_a[ind] == '?':
+                    qmark_loc = ind + 1
+                cur = [start, start + len(tokens_a[ind])]  #non inclusive end        
+                token2char_indmap.append(cur)
+                start += len(tokens_a[ind]) + 1  #+1 to account for space
+             
+            if qmark_loc == -1:
+                print("QMARK not found in ",tokens_a)
+
+            debug = False
+            if debug or i < 4:
+                print("\nCONVERT SENT",i,len(sents), "? loc", qmark_loc, sent) 
+                print("Tokens:", len(tokens_a), tokens_a)
+                #print("\n with ENT SPANS", len(ent_spans), len(ent_spans[0]), len(ent_spans[0][0]))    # 5 3 32
+                if i < 5:
+                    print("TOKEN2CHAR",[[l,tokens_a[l], token2char_indmap[l]] for l in range(len(token2char_indmap))])
+
+            char2token_indmap = []
+            cur_tok = 0
+            cur_tok_range = token2char_indmap[cur_tok]      # NOTE THAT the start,end are based on position of ?!!
+            for ind in range(start - 1):
+                if ind >= cur_tok_range[0] and ind < cur_tok_range[1]:
+                    char2token_indmap.append(cur_tok)
+                else:
+                    cur_tok += 1
+                    cur_tok_range = token2char_indmap[cur_tok]
+                    char2token_indmap.append(cur_tok)
+
+            if debug or i < 5:
+                print("CHAR2TOKEN",[[l,sent[l], char2token_indmap[l], tokens_a[char2token_indmap[l]]] for l in range(len(char2token_indmap))])
+        
+               
+            #add UNK token to tokens_a around entities
+            offset = 0
+            # ent spans is Num Ents x [Name,Start,End] x batch num
+            cur_ents = [ [ent_spans[e][0][i], int(ent_spans[e][1][i]), int(ent_spans[e][2][i])] for e in range(len(ent_spans))]  #[name, start, end] for each ent in sentence
+             
+            # SORT THIS BY START INDEXES FIRST
+            cur_ents_sorted = sorted(cur_ents, key=itemgetter(1))
+            for eind, e in enumerate(cur_ents_sorted):
+               cur_e, cur_charstart, cur_charend = e 
+               print("LOOKING AT ",cur_e,"with charSTART:",cur_charstart, "and END:", cur_charend)   #this doesn't take ## into account
+               if cur_charstart == -1: 
+                   continue
+               else:
+                   front_add_ind = qmark_loc +  char2token_indmap[cur_charstart] + offset     #tokloc of ? + token of cur_charstart
+
+                   print("FRONT:  QMARK_loc:", qmark_loc, cur_charstart, "Char2Token: ",char2token_indmap[cur_charstart], " [",tokens_a[char2token_indmap[cur_charstart]+qmark_loc], "], + OFFSET:",offset)
+                   print( "Front_ID:", front_add_ind," [",tokens_a[front_add_ind],"]")
+                   if eind == 0:
+                       #some of entity starts are initiall off by one
+                       if tokens_a[front_add_ind] in cur_e.lower() and tokens_a[end_add_ind-1] not in cur_e.lower():
+                           print("found1 ", front_add_ind, tokens_a[front_add_ind], "in ",cur_e)
+                       else:
+                           print("err1:",front_add_ind, tokens_a[front_add_ind], "not found in ", cur_e)
+                           offset -= 1
+                           front_add_ind = char2token_indmap[cur_charstart] + qmark_loc + offset
+                           if tokens_a[front_add_ind] in cur_e.lower() and tokens_a[end_add_ind-1] not in cur_e.lower():
+                               print("found2 ", front_add_ind, tokens_a[front_add_ind], "in ",cur_e)
+                           else:
+                               print("err2:",front_add_ind, tokens_a[front_add_ind], "not found in ", cur_e)
+                               offset += 2
+                               front_add_ind = char2token_indmap[cur_charstart] + qmark_loc + offset
+                               if tokens_a[front_add_ind] in cur_e.lower() and tokens_a[end_add_ind-1] not in cur_e.lower():
+                                   print("found3 ", front_add_ind, tokens_a[front_add_ind], "in ",cur_e)
+                               else:
+                                   print("still no dice", front_add_ind, tokens_a[front_add_ind], "not found in ", cur_e)
+                                   import sys
+                                   sys.exit()
+                       
+                   end_add_ind = char2token_indmap[cur_charend] + qmark_loc + offset
+                   print("END:  QMARK_loc:", qmark_loc, cur_charend, "Char2Token: ",char2token_indmap[cur_charend], " [",tokens_a[char2token_indmap[cur_charend]+qmark_loc], "], +OFFSET:",offset)
+                   print( "END_ID:", end_add_ind," [",tokens_a[end_add_ind],"]")
+                   if eind == 0:
+                       #make sure token at end_add_ind is not in current entity!  # TODO NEED TO ACCOUNT FOR ###s
+                       if tokens_a[end_add_ind] not in cur_e.lower() and tokens_a[end_add_ind-1] in cur_e.lower():
+                           good = 1
+                       else:
+                           print("err3:",end_add_ind, tokens_a[end_add_ind], "found in ", cur_e)  #this is probably too sensitive
+                           offset += 1
+                           end_add_ind = char2token_indmap[cur_charend] + qmark_loc + offset
+                           if tokens_a[end_add_ind] not in cur_e.lower() and  tokens_a[end_add_ind-1] in cur_e.lower():
+                               good = 2
+                           else:              
+                               print("err4:",end_add_ind, tokens_a[end_add_ind], "not found in ", cur_e)
+                               offset += 1
+                               end_add_ind = char2token_indmap[cur_charend] + qmark_loc + offset
+                               if tokens_a[end_add_ind] not in cur_e.lower() and tokens_a[end_add_ind-1] in cur_e.lower() :
+                                   print("err5:",end_add_ind, tokens_a[end_add_ind], "not found in ", cur_e)
+                               else:
+                                   print("still no dice5", end_add_ind, tokens_a[end_add_ind], "not found in ", cur_e)
+                                   import sys
+                                   sys.exit()
+
+                   print("\tfor entity:",cur_e,", add UNK at token", front_add_ind, "(",tokens_a[front_add_ind],") and ending before token ",end_add_ind,"(",tokens_a[end_add_ind+1],")")
+                   tokens_a = tokens_a[:front_add_ind] + ["[UNK]"] + tokens_a[front_add_ind:end_add_ind] + ["[UNK]"] + tokens_a[end_add_ind:]
+                   print("\t\t", tokens_a)
+                   offset += 2  #for adding two uncs to token list
+               
+            if debug or i < 5:
+                #print("CHAR2TOKEN",char2token_indmap)
+                #print("CUR ents", len(cur_ents))
+                print("Cur Ents", len([a for a in cur_ents_sorted if a[1] != -1]), cur_ents_sorted)
+                print("POST ADDING UNKS: ", len(tokens_a), tokens_a)
+ 
+                if i == 4:
+                    import sys
+                    sys.exit()
+
+            # NOW verify here and then add changes to modeling.py to use mapper and add slash!
+
+
+        # Account for [CLS] and [SEP] with "- 2"
+        if len(tokens_a) > max_seq_length - 2:
+            tokens_a = tokens_a[:(max_seq_length - 2)]
+        
+        # Keep segment id which allows loading BERT-weights.
+        tokens = ["[CLS]"] + tokens_a + ["[SEP]"]
+        segment_ids = [0] * len(tokens)
+
+        input_ids = tokenizer.convert_tokens_to_ids(tokens)
+
+        # The mask has 1 for real tokens and 0 for padding tokens. Only real
+        # tokens are attended to.
+        input_mask = [1] * len(input_ids)
+
+        # Zero-pad up to the sequence length.
+        padding = [0] * (max_seq_length - len(input_ids))
+        input_ids += padding
+        input_mask += padding
+        segment_ids += padding
+
+        assert len(input_ids) == max_seq_length
+        assert len(input_mask) == max_seq_length
+        assert len(segment_ids) == max_seq_length
+
+        features.append(
+                InputFeatures(input_ids=input_ids,
+                              input_mask=input_mask,
+                              segment_ids=segment_ids))
+    return features
+
+
+def set_visual_config(args):
+    VISUAL_CONFIG.l_layers = args.llayers
+    VISUAL_CONFIG.x_layers = args.xlayers
+    VISUAL_CONFIG.r_layers = args.rlayers
+
+
+def load_mapper(name):
+    return LinearMapper.load(name)
+
+class Mapper:
+    pass
+
+class LinearMapper(Mapper):
+    def train(self, x, y, w=None, verbose=0):
+        if not w is None:
+            w_sqrt = np.expand_dims(np.sqrt(w), -1)
+            x *= w_sqrt
+            y *= w_sqrt
+
+        self.model = np.linalg.lstsq(x, y, rcond=None)[0]
+
+    def apply(self, x, verbose=0):
+        return x.dot(self.model)
+
+    def save(self, path):
+        if not path.endswith(".npy"):
+            path += ".npy"
+        np.save(path, self.model)
+
+    @classmethod
+    def load(cls, path):
+        obj = cls()
+        if not path.endswith(".npy"):
+            path += ".npy"
+
+        if not os.path.exists(path):
+            path = os.path.join("ebert/mappers/", path)
+
+        obj.model = np.load(path)
+        return obj
+
+class LXRTEncoder(nn.Module):
+    def __init__(self, args, max_seq_length, use_lm=None, mode='x'):
+        super().__init__()
+        self.max_seq_length = max_seq_length
+        self.use_lm = use_lm
+        set_visual_config(args)
+
+        if use_lm != None:
+            if use_lm == "ebert":
+                #load linear WikipediaVec to LXMERT pretrained BERT mapper !
+                # force linear map
+                self.mapper = load_mapper("wikipedia2vec-base-cased.lxmert-bert-base-uncased.linear")
+
+        # Using the bert tokenizer
+        self.tokenizer = BertTokenizer.from_pretrained(
+            "bert-base-uncased",
+            do_lower_case=True
+        )
+
+        # Build LXRT Model
+        self.model = VisualBertForLXRFeature.from_pretrained(
+            "bert-base-uncased",
+            mode=mode
+        )
+
+        if args.from_scratch:
+            print("initializing all the weights")
+            self.model.apply(self.model.init_bert_weights)
+
+    def multi_gpu(self):
+        self.model = nn.DataParallel(self.model)
+
+    @property
+    def dim(self):
+        return 768
+
+    def forward(self, sents, ent_spans, feats, visual_attention_mask=None):
+        # QUESTION SHOULD I DO SLASH REPLACE IN convert_sents_to_features
+        train_features = convert_sents_to_features(
+            sents, ent_spans, self.max_seq_length, self.tokenizer, self.use_lm)
+
+        print("SENTS:",sents)
+        print("INPUT IDS", train_features[0].input_ids)
+        # For now do one run and see what happens
+        input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long).cuda()
+        # INPUT IDS [101, 2040, 2003, 1996, 2711, 1999, 1996, 3746, 1029, 28541, 12170, 2319, 5428, 1999, 21199, 2566, 4895, 4005, 2063, 7367, 17603, 3406, 1006, 3547, 1007, 102, 0, 0, ...]
+        input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long).cuda()
+        segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long).cuda()
+        
+        print("POST TENSOR", type(input_ids), input_ids.shape, input_ids)   #still not BERT Embedding
+        # POST TENSOR <class 'torch.Tensor'> torch.Size([32, 100]) 
+        """
+         tensor([[ 101, 2040, 2003,  ...,    0,    0,    0],
+        [ 101, 2079, 2035,  ...,    0,    0,    0],
+        ...,
+        [ 101, 2129, 2116,  ...,    0,    0,    0]], device='cuda:0')
+        """
+
+        # so input_ids is a tensor of batch size x max token len
+        output = self.model(input_ids, segment_ids, input_mask, visual_feats=feats, visual_attention_mask=visual_attention_mask)
+        return output
+
+    def save(self, path):
+        torch.save(self.model.state_dict(),
+                   os.path.join("%s_LXRT.pth" % path))
+
+    def load(self, path):
+        # Load state_dict from snapshot file
+        print("Load LXMERT pre-trained model from %s" % path)
+        state_dict = torch.load("%s_LXRT.pth" % path)
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("module."):
+                new_state_dict[key[len("module."):]] = value
+            else:
+                new_state_dict[key] = value
+        state_dict = new_state_dict
+
+        # Print out the differences of pre-trained and model weights.
+        load_keys = set(state_dict.keys())
+        model_keys = set(self.model.state_dict().keys())
+        print()
+        print("Weights in loaded but not in model:")
+        for key in sorted(load_keys.difference(model_keys)):
+            print(key)
+        print()
+        print("Weights in model but not in loaded:")
+        for key in sorted(model_keys.difference(load_keys)):
+            print(key)
+        print()
+
+        # Load weights to model
+        self.model.load_state_dict(state_dict, strict=False)
+
+
+
+
